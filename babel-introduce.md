@@ -184,3 +184,344 @@ npm install --save-dev @babel/plugin-transform-runtime
 > 大家一定不要迷信往上的所有教程或文章，包括我写的这一系列。最重要的还是要跟官方的介绍结合起来。只有这样，你的理解才不会出现大的偏差。因为网上的文章介绍这类的很多，但其中不乏大量拿来主义的文章，其中有很多纰漏，很容易让大家从这个坑跳入另一个坑，坑坑相连，不能自拔。。。还有的文章写的确实很好，但是缺乏真实的场景举例，导致读者在理解的时候也出现大的偏差，在困顿中无法自拔。
 
 ok，提醒了大家很多，后面开始用实例来印证上面我说的，让大家理论与实践结合，少走冤枉路。
+
+
+## 从真实代码环境中找思路
+
+> 我准备用反证的形式来证明我上面所说的，也更能让大家理解。
+
+### 1. 如果不设置 presets，编译的结果是什么样的。
+默认 .babel是没有设置的
+
+看原代码:
+
+```
+[1, 2, 3].map((n) => n + 1);
+class Circle {
+    construtor(){
+
+    }
+    circleItem() {
+        return 'test'
+    }
+}
+const obj = Object.assign({}, {a: 1}, {b: 2});
+```
+我的项目package.json里设置的:
+
+```
+"scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dist": "babel index.js -d dist"
+  },
+```
+
+执行 `npm run dist`
+
+得到的结果是:
+
+```
+[1, 2, 3].map((n) => n + 1);
+class Circle {
+    construtor(){
+
+    }
+    circleItem() {
+        return 'test'
+    }
+}
+const obj = Object.assign({}, {a: 1}, {b: 2});
+
+```
+没变化，呵呵了。。。其实这也很好理解，通过执行babel，执行@babel/core的逻辑，把我们的代码转成AST树。但是我们没有对树进行任何操作，没有对新语法的解析，没有对新api的解析，所以ATS树又原样的返回了。 相信大家对这个能理解。
+
+好，那我们就在这个基础上，一点一点加功能。那想办法把语法转一下吧，如果能把新api转一下那就一劳永逸了。
+
+下面把 presets加入吧~~
+
+```
+// .babelrc
+
+{
+    "presets": [
+        [
+            "@babel/preset-env",
+            {
+                "debug": false,
+                "targets": {"browsers": [">1%", "last 2 versions", "safari >= 12"]}
+            }
+        ]
+    ]
+}
+
+```
+
+原代码还是上面的，现在我们执行 `npm install @babel/preset-env -D` ,然后再执行 `npm run dist`,看看产出结果吧：
+
+```
+// 箭头函数正常转es5了
+
+[1, 2, 3].map(function (n) {
+  return n + 1;
+});
+
+// class 也正常转了
+
+var Circle =
+/*#__PURE__*/
+function () {
+  function Circle() {
+    _classCallCheck(this, Circle);
+  }
+
+  _createClass(Circle, [{
+    key: "construtor",
+    value: function construtor() {}
+  }, {
+    key: "circleItem",
+    value: function circleItem() {
+      return 'test';
+    }
+  }]);
+
+  return Circle;
+}();
+
+// Object.assign 没转。。。。
+
+var obj = Object.assign({}, {
+  a: 1
+}, {
+  b: 2
+});
+```
+
+从上面结果可以看到，语法层面的转了，但是新api没转译。
+
+还记得我上面提过 preset-env中的options中有个 `useBuiltIns`参数么？好的，现在再试试
+
+```
+// .babelrc
+
+{
+    "presets": [
+        [
+            "@babel/preset-env",
+            {
+                "debug": false,
+                "targets": {"browsers": [">1%", "last 2 versions", "safari >= 12"]},
+                "useBuiltIns": "usage"
+            }
+        ]
+    ]
+}
+
+```
+
+继续执行 `npm run dist` 吧。
+
+结果如下：
+
+```
+require("core-js/modules/es6.object.assign");
+
+// Object.assign 额？没转？ 别着急，往上找
+
+var obj = Object.assign({}, {
+  a: 1
+}, {
+  b: 2
+});
+```
+
+现在能看到很重要的一行：
+
+```
+require("core-js/modules/es6.object.assign");
+```
+
+奥，原来是引了一个专门的处理Object.assign的文件啊，这就能解释的通 `useBuiltIns: 'usage'`这个参数的作用了.
+
+同时，我们也要知道，通过增加useBuiltIns参数，polyfill是来自 `node_modules`里的 `core-js`。这里与后面的`@babel/plugin-transform-runtime`区分开，后面也再详细说一说。
+
+> 注：大家可以改成 useBuiltIns: "entry"试试，看看打包后的文件有多大？
+
+现在看着我们担心的问题解决了，貌似完美了。其实还没有。继续往下看：
+
+我们发现现在的es6.object.assign引入方式，可是直接require引入的，也就是说，这个es6.object.assign是作用于全局了。这种情况，如果我们单纯些业务逻辑，基本上不会有什么问题，但是如果我们写的是很多人在用的插件呢？而且碰巧，你的插件里对Object.assign进行了重新改写：
+
+```
+Object.prototype.assign = function(){
+    ....
+}
+
+```
+
+那结果就是你的插件很大概率不会按你预想的执行.
+
+所以，我们需要能够让polyfill在一个局部空间内，不要影响其他功能。好了，向大家隆重介绍：@babel/plugin-transform-runtime
+
+> 这里还要知道，@babel/plugin-transform-runtime、@babel/runtime、@babel/runtime-corejs2之间的关系~~。照官网上说，@babel/plugin-transform-runtime是要依赖@babel/runtime，而又说transform-runtime可以实现polyfill的功能，那@babel/runtime-corejs2又是什么？ @babel/plugin-transform-runtime跟 @babel/preset-env都有相同的功能，怎么取舍？怎么个情况？ 是不是头又大了？
+
+
+嗯，像这种情况比较麻烦了，插件之间糊成一团了。。。官网上貌似也没查明白。。。
+
+这样吧，实践是检验真理的唯一标准，开撸
+
+这样，先分两个大类进行区分： @babel/preset-env 和 transform-runtime + runtime；  @babel/preset-env + runtime-corejs2
+
+
+先看第一大类：
+
+```
+    // 先看只有 preset-env的情况
+    {
+        "presets": [
+            [
+                "@babel/preset-env",
+                {
+                    "debug": false,
+                    "targets": {"browsers": [">1%", "last 2 versions", "safari >= 7"]},
+                    "useBuiltIns": "usage"
+                }
+            ]
+        ],
+    }
+
+    // 结果是成功加入polyfill,只是有全局的隐忧
+
+    require("core-js/modules/es6.object.assign");
+    var obj = Object.assign({}, {
+      a: 1
+    }, {
+      b: 2
+    });
+
+    // 然后看把"useBuiltIns": "usage"去掉的情况
+
+    {
+        "presets": [
+            [
+                "@babel/preset-env",
+                {
+                    "debug": false,
+                    "targets": {"browsers": [">1%", "last 2 versions", "safari >= 7"]}
+                }
+            ]
+        ],
+        "plugins": [
+            [
+                "@babel/plugin-transform-runtime",
+
+            ]
+        ],
+    }
+
+    // 结果是： 没有成功polyfill, 啊？ 标榜的可以polyfill呢？？？
+    // 那去找 @babel/runtime,果真里面没有Object.assign的polyfill，同样也没找到那些新的api的polyfill
+
+```
+
+再看第二大类：
+
+```
+// 同样可以polyfill,只是暴露到全局中
+{
+    "presets": [
+        [
+            "@babel/preset-env",
+            {
+                "debug": false,
+                "targets": {"browsers": [">1%", "last 2 versions", "safari >= 7"]},
+                "useBuiltIns": "usage"
+            }
+        ]
+    ],
+
+}
+
+// 用 runtime-corejs2
+{
+    "presets": [
+        [
+            "@babel/preset-env",
+            {
+                "debug": false,
+                "targets": {"browsers": [">1%", "last 2 versions", "safari >= 7"]}
+            }
+        ]
+    ],
+    "plugins": [
+        [
+            "@babel/plugin-transform-runtime",
+            {
+                "corejs": 2
+            }
+
+        ]
+    ],
+}
+// 喔！！！成功了，而且看产出，能看到已经包装成局部变量了
+
+var _assign = _interopRequireDefault(require("@babel/runtime-corejs2/core-js/object/assign"));
+var obj = (0, _assign.default)({}, {
+  a: 1
+}, {
+  b: 2
+});
+
+```
+
+所以从以上的实验中，可以看到最合适的用法就是用 runtime-corejs2的这种啊！！！
+
+从文档中，我们还能看到@babel/plugin-transform-runtime还有一个作用，就是把各个文件中生成的那些相同的代码合并到一处，减小代码体积
+
+举个例子：
+
+```
+// 源码
+class Person {}
+
+```
+如果不用 @babel/plugin-transform-runtime的产出
+
+```
+function _classCallCheck(instance, Constructor) {
+  if (!(instance instanceof Constructor)) {
+    throw new TypeError("Cannot call a class as a function");
+  }
+}
+
+var Person = function Person() {
+  _classCallCheck(this, Person);
+};
+```
+
+如果用@babel/plugin-transform-runtime
+
+```
+var _classCallCheck2 = _interopRequireDefault(require("@babel/runtime-corejs2/helpers/classCallCheck"));
+
+var _classCallCheck3 = _interopRequireDefault(_classCallCheck2);
+
+function _interopRequireDefault(obj) {
+  return obj && obj.__esModule ? obj : { default: obj };
+}
+
+var Person = function Person() {
+  (0, _classCallCheck3.default)(this, Person);
+};
+```
+
+那么不同的模块间最后只引同一个`@babel/runtime-corejs2/helpers/classCallCheck`即可，不需要每个模块都重复定义一次`_classCallCheck`函数,是不是的确很方便了?
+
+### 总结一下：
+- @babel/preset-env 两个重要作用：1. 方便我们新语法的解析，不用去一个一个的找对应新语法的解释器(插件)；2.可以直接通过`"useBuiltIns": "usage"`进行新api平稳过度到es5，但是是全局性的
+- @babel/plugin-transform-runtime 也有两个作用：1.通过与@babel/runtime-corejs2合作，对新api进行polyfill，过度到es5，而且这种polyfill是局部性的，比"useBuiltIns": "usage"要优秀；2.可以对babel编译过的重复代码进行合并，减小代码体积。
+
+
+通过我上面的看似挺麻烦的实验，我们一定对babel的原理和各个babel插件间的配合有个一个更清晰的认识。
+
+实例源码在这里: [github源码地址](https://github.com/fuqqnl/bable-guide)
+
+赠人玫瑰，手有余香，喜欢的朋友请start一下，鼓励我继续创作~~
